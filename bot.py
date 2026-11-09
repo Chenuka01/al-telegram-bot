@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -68,6 +69,13 @@ def init_db():
             year    INTEGER NOT NULL,
             file_id TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS notes(
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            stream  TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            title   TEXT NOT NULL,
+            file_id TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS questions(
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             stream      TEXT NOT NULL,
@@ -108,7 +116,6 @@ def execute(sql, params=()):
 
 
 def record_answer(user_id: int, subject: str, correct: bool):
-    """Update both global scores and per-subject scores."""
     execute(
         'UPDATE scores SET points=points+?, answered=answered+1 WHERE user_id=?',
         (int(correct), user_id),
@@ -132,17 +139,31 @@ def keyboard(items, prefix):
     ])
 
 
-def menu():
+def menu(is_adm: bool = False):
     buttons = [
         ('📚 Past Papers',    'papers'),
+        ('📖 Short Notes',    'notes'),
         ('📝 MCQ Quiz',       'quiz'),
         ('🔁 Practice Mode', 'practice'),
         ('📊 My Progress',   'progress'),
         ('🏆 Leaderboard',   'leaderboard'),
-        ('🤖 AI Tutor',      'ai'),
         ('🔄 Change Stream', 'stream'),
     ]
+    if is_adm:
+        buttons.append(('⚙️ Admin Panel', 'admin_panel'))
     return keyboard(buttons, 'menu')
+
+
+def admin_menu_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='➕ Add Question (Manual)', callback_data='adm:add_q_stream')],
+        [InlineKeyboardButton(text='✨ AI Generate Questions (Gemini)', callback_data='adm:ai_q_stream')],
+        [InlineKeyboardButton(text='📄 Upload Past Paper (PDF)', callback_data='adm:add_paper_stream')],
+        [InlineKeyboardButton(text='📖 Upload Short Note (PDF)', callback_data='adm:add_note_stream')],
+        [InlineKeyboardButton(text='📢 Broadcast to All Students', callback_data='adm:broadcast')],
+        [InlineKeyboardButton(text='📊 View Bot Stats', callback_data='adm:stats')],
+        [InlineKeyboardButton(text='🏠 Main Menu', callback_data='menu:main')],
+    ])
 
 
 # ── FSM States ──────────────────────────────────────────────────────────────
@@ -154,33 +175,54 @@ class AddPaper(StatesGroup):
     document = State()
 
 
-class AddQuestion(StatesGroup):
+class AddNote(StatesGroup):
+    stream   = State()
+    subject  = State()
+    title    = State()
+    document = State()
+
+
+class ManualQuestion(StatesGroup):
+    stream      = State()
+    subject     = State()
+    question    = State()
+    opt_a       = State()
+    opt_b       = State()
+    opt_c       = State()
+    opt_d       = State()
+    answer      = State()
+    explanation = State()
+
+
+class AIGenerateQuestions(StatesGroup):
     stream  = State()
     subject = State()
-    content = State()
+    prompt  = State()
 
 
-class AIChat(StatesGroup):
-    question = State()
+class BroadcastMessage(StatesGroup):
+    message = State()
 
 
-# ── /start ──────────────────────────────────────────────────────────────────
+# ── /start & Main Menu ──────────────────────────────────────────────────────
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
+    uid = message.from_user.id
     execute(
         'INSERT INTO students(user_id,name) VALUES(?,?) '
         'ON CONFLICT(user_id) DO UPDATE SET name=excluded.name',
-        (message.from_user.id, message.from_user.full_name),
+        (uid, message.from_user.full_name),
     )
-    execute('INSERT OR IGNORE INTO scores(user_id) VALUES(?)', (message.from_user.id,))
-    row = query('SELECT stream FROM students WHERE user_id=?', (message.from_user.id,))[0]
+    execute('INSERT OR IGNORE INTO scores(user_id) VALUES(?)', (uid,))
+    row = query('SELECT stream FROM students WHERE user_id=?', (uid,))[0]
+
     if row['stream']:
         await message.answer(
             f'👋 Welcome back, <b>{message.from_user.first_name}</b>!\n'
             'Choose an option from the menu:',
-            reply_markup=menu(),
+            reply_markup=menu(is_adm=(uid in ADMINS)),
         )
     else:
         await message.answer(
@@ -189,8 +231,6 @@ async def start(message: Message, state: FSMContext):
             reply_markup=keyboard([(v, k) for k, v in STREAMS.items()], 'stream'),
         )
 
-
-# ── Stream selection ─────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith('stream:'))
 async def choose_stream(call: CallbackQuery, state: FSMContext):
@@ -201,12 +241,10 @@ async def choose_stream(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.answer(
         f'✅ Stream set: <b>{STREAMS[stream]}</b>\n\nChoose an option:',
-        reply_markup=menu(),
+        reply_markup=menu(is_adm=(call.from_user.id in ADMINS)),
     )
     await call.answer()
 
-
-# ── Main Menu ────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith('menu:'))
 async def menu_click(call: CallbackQuery, state: FSMContext):
@@ -214,7 +252,15 @@ async def menu_click(call: CallbackQuery, state: FSMContext):
     await state.clear()
     uid = call.from_user.id
 
-    if action == 'stream':
+    if action == 'main':
+        await call.message.answer('🏠 Main Menu:', reply_markup=menu(is_adm=(uid in ADMINS)))
+
+    elif action == 'admin_panel':
+        if uid not in ADMINS:
+            return await call.answer('Admin only!', show_alert=True)
+        await call.message.answer('⚙️ <b>Admin Control Panel</b>\nManage quizzes, papers, notes & broadcasts:', reply_markup=admin_menu_keyboard())
+
+    elif action == 'stream':
         await call.message.answer(
             'Stream change කරන්න:',
             reply_markup=keyboard([(v, k) for k, v in STREAMS.items()], 'stream'),
@@ -226,16 +272,7 @@ async def menu_click(call: CallbackQuery, state: FSMContext):
     elif action == 'progress':
         await show_progress(call)
 
-    elif action == 'ai':
-        await state.set_state(AIChat.question)
-        await call.message.answer(
-            '🤖 <b>AI Tutor</b>\n'
-            'ඔබේ A/L ප්‍රශ්නය type කරන්න (Sinhala/English OK).\n'
-            'AI ලබාදෙන answers verify කරන්න.\n\n'
-            '/cancel to exit.',
-        )
-
-    elif action in ('papers', 'quiz', 'practice'):
+    elif action in ('papers', 'notes', 'quiz', 'practice'):
         rows = query('SELECT stream FROM students WHERE user_id=?', (uid,))
         stream = rows[0]['stream'] if rows else None
         if not stream:
@@ -244,28 +281,27 @@ async def menu_click(call: CallbackQuery, state: FSMContext):
                 reply_markup=keyboard([(v, k) for k, v in STREAMS.items()], 'stream'),
             )
         else:
-            prefix_map = {'papers': 'papers', 'quiz': 'quiz', 'practice': 'practice'}
-            label_map  = {
+            label_map = {
                 'papers':   '📚 Which subject\'s papers?',
+                'notes':    '📖 Which subject\'s notes?',
                 'quiz':     '📝 Quiz — subject select කරන්න:',
                 'practice': '🔁 Practice Mode — subject select කරන්න:',
             }
             await call.message.answer(
                 label_map[action],
-                reply_markup=keyboard([(s, s) for s in SUBJECTS[stream]], prefix_map[action]),
+                reply_markup=keyboard([(s, s) for s in SUBJECTS[stream]], action),
             )
 
     await call.answer()
 
 
-# ── Leaderboard ──────────────────────────────────────────────────────────────
+# ── Leaderboard & Progress ──────────────────────────────────────────────────
 
 async def show_leaderboard(call: CallbackQuery):
     uid = call.from_user.id
     rows = query('SELECT stream FROM students WHERE user_id=?', (uid,))
     stream = rows[0]['stream'] if rows else None
 
-    # Global top 10
     global_rows = query(
         'SELECT s.name, sc.points, sc.answered '
         'FROM scores sc JOIN students s ON s.user_id=sc.user_id '
@@ -282,7 +318,6 @@ async def show_leaderboard(call: CallbackQuery):
     if not global_rows:
         lines.append('No results yet. Quiz play කරලා score ගන්න!')
 
-    # Stream leaderboard (if student has a stream)
     if stream:
         stream_rows = query(
             'SELECT s.name, sc.points, sc.answered '
@@ -296,20 +331,15 @@ async def show_leaderboard(call: CallbackQuery):
             medal = MEDALS[i-1] if i <= 3 else f'{i}.'
             pct   = round(r['points'] / r['answered'] * 100) if r['answered'] else 0
             lines.append(f'{medal} {r["name"]} — {r["points"]}/{r["answered"]} ({pct}%)')
-        if not stream_rows:
-            lines.append('No stream results yet.')
 
-    await call.message.answer('\n'.join(lines), reply_markup=menu())
+    await call.message.answer('\n'.join(lines), reply_markup=menu(is_adm=(uid in ADMINS)))
 
-
-# ── Subject-wise Progress ─────────────────────────────────────────────────────
 
 async def show_progress(call: CallbackQuery):
     uid = call.from_user.id
     rows = query('SELECT stream FROM students WHERE user_id=?', (uid,))
     stream = rows[0]['stream'] if rows else None
 
-    # Overall score
     sc = query('SELECT points, answered FROM scores WHERE user_id=?', (uid,))
     r  = sc[0] if sc else {'points': 0, 'answered': 0}
     overall_pct = round(r['points'] / r['answered'] * 100) if r['answered'] else 0
@@ -328,13 +358,13 @@ async def show_progress(call: CallbackQuery):
         if subj_rows:
             lines.append('📚 <b>Subject Breakdown:</b>')
             for s in subj_rows:
-                pct  = round(s['correct'] / s['answered'] * 100) if s['answered'] else 0
-                bar  = progress_bar(pct)
+                pct = round(s['correct'] / s['answered'] * 100) if s['answered'] else 0
+                bar = progress_bar(pct)
                 lines.append(f'  • <b>{s["subject"]}</b>: {s["correct"]}/{s["answered"]} ({pct}%)\n    {bar}')
         else:
-            lines.append('Quiz/Practice play කළාට subject progress දිස්වෙයි.')
+            lines.append('Quiz/Practice play කළ පසු විෂය ප්‍රගතිය මෙහි පෙන්වනු ඇත.')
 
-    await call.message.answer('\n'.join(lines), reply_markup=menu())
+    await call.message.answer('\n'.join(lines), reply_markup=menu(is_adm=(uid in ADMINS)))
 
 
 def progress_bar(pct: int, length: int = 10) -> str:
@@ -342,7 +372,7 @@ def progress_bar(pct: int, length: int = 10) -> str:
     return '█' * filled + '░' * (length - filled) + f' {pct}%'
 
 
-# ── Past Papers ───────────────────────────────────────────────────────────────
+# ── Past Papers & Notes (Student View) ──────────────────────────────────────
 
 @router.callback_query(F.data.startswith('papers:'))
 async def papers(call: CallbackQuery):
@@ -379,7 +409,42 @@ async def send_paper(call: CallbackQuery):
     await call.answer()
 
 
-# ── Quiz (10 questions, scored) ───────────────────────────────────────────────
+@router.callback_query(F.data.startswith('notes:'))
+async def notes(call: CallbackQuery):
+    subject = call.data.split(':', 1)[1]
+    rows    = query('SELECT stream FROM students WHERE user_id=?', (call.from_user.id,))
+    stream  = rows[0]['stream'] if rows else None
+    if not stream or subject not in SUBJECTS.get(stream, []):
+        return await call.answer('Choose a valid subject', show_alert=True)
+    ns = query(
+        'SELECT id, title FROM notes WHERE stream=? AND subject=? ORDER BY id DESC',
+        (stream, subject),
+    )
+    await call.message.answer(
+        f'📖 <b>{subject}</b> — Short Notes:' if ns else '❌ No notes uploaded yet.',
+        reply_markup=keyboard(
+            [(f'📖 {n["title"]}', n['id']) for n in ns[:80]], 'note'
+        ) if ns else None,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('note:'))
+async def send_note(call: CallbackQuery):
+    nid  = call.data.split(':', 1)[1]
+    rows = query(
+        'SELECT n.* FROM notes n JOIN students s ON s.stream=n.stream '
+        'WHERE n.id=? AND s.user_id=?',
+        (nid, call.from_user.id),
+    )
+    if not rows:
+        return await call.answer('Note not found', show_alert=True)
+    n = rows[0]
+    await call.message.answer_document(n['file_id'], caption=f'📖 {n["subject"]} — {n["title"]}')
+    await call.answer()
+
+
+# ── Quiz & Practice Execution ───────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith('quiz:'))
 async def quiz(call: CallbackQuery, state: FSMContext):
@@ -405,8 +470,6 @@ async def quiz(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# ── Practice Mode (infinite, no score cap) ───────────────────────────────────
-
 @router.callback_query(F.data.startswith('practice:'))
 async def practice(call: CallbackQuery, state: FSMContext):
     subject = call.data.split(':', 1)[1]
@@ -426,7 +489,6 @@ async def practice(call: CallbackQuery, state: FSMContext):
             index=0, correct=0,
             subject=subject,
             mode='practice',
-            stream=stream,
         )
         await call.message.answer(
             f'🔁 <b>Practice Mode — {subject}</b>\n'
@@ -436,12 +498,10 @@ async def practice(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# ── Shared question sender ────────────────────────────────────────────────────
-
 async def send_question(message: Message, state: FSMContext):
-    data        = await state.get_data()
-    ids, index  = data['quiz_ids'], data['index']
-    mode        = data.get('mode', 'quiz')
+    data       = await state.get_data()
+    ids, index = data['quiz_ids'], data['index']
+    mode       = data.get('mode', 'quiz')
 
     if index >= len(ids):
         subject = data.get('subject', '')
@@ -451,7 +511,6 @@ async def send_question(message: Message, state: FSMContext):
         bar     = progress_bar(pct)
 
         if mode == 'practice':
-            # Offer to continue with more questions
             await message.answer(
                 f'🔁 <b>Practice Round Done!</b>\n\n'
                 f'📊 {subject}\n'
@@ -459,7 +518,7 @@ async def send_question(message: Message, state: FSMContext):
                 f'Continue practice කරන්නද?',
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text='🔁 Continue Practice', callback_data=f'practice:{subject}')],
-                    [InlineKeyboardButton(text='🏠 Main Menu',         callback_data='menu:score')],
+                    [InlineKeyboardButton(text='🏠 Main Menu',         callback_data='menu:main')],
                 ]),
             )
         else:
@@ -468,7 +527,7 @@ async def send_question(message: Message, state: FSMContext):
                 f'{emoji} <b>Quiz Complete!</b>\n\n'
                 f'📊 {subject}\n'
                 f'✅ {correct}/{total} correct   {bar}\n\n'
-                '{"Well done! 🌟" if pct >= 70 else "Keep practicing! 💪"}',
+                f'{"Well done! 🌟" if pct >= 70 else "Keep practicing! 💪"}',
                 reply_markup=menu(),
             )
         await state.clear()
@@ -479,7 +538,7 @@ async def send_question(message: Message, state: FSMContext):
         await state.update_data(index=index + 1)
         return await send_question(message, state)
 
-    q    = rows[0]
+    q = rows[0]
     mode_tag = '🔁 Practice' if mode == 'practice' else '📝 Quiz'
     text = (
         f'{mode_tag} | Q {index+1}/{len(ids)}\n\n'
@@ -491,8 +550,6 @@ async def send_question(message: Message, state: FSMContext):
     )
     await message.answer(text, reply_markup=keyboard([(x, x) for x in 'ABCD'], 'answer'))
 
-
-# ── Answer handler ────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith('answer:'))
 async def answer(call: CallbackQuery, state: FSMContext):
@@ -513,10 +570,7 @@ async def answer(call: CallbackQuery, state: FSMContext):
     correct = chosen == q['answer']
     subject = data.get('subject', q['subject'])
 
-    # Prevent double-scoring on repeated taps
     await call.message.edit_reply_markup(reply_markup=None)
-
-    # Record in both global + subject tables
     record_answer(call.from_user.id, subject, correct)
 
     result_icon = '✅ Correct!' if correct else f'❌ Incorrect. Answer: <b>{q["answer"]}</b>'
@@ -530,218 +584,353 @@ async def answer(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# ── /cancel ───────────────────────────────────────────────────────────────────
+# ── ADMIN PANEL & MANAGEMENT ────────────────────────────────────────────────
+
+@router.message(Command('admin'))
+async def admin_cmd(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMINS:
+        return await message.answer('Admin only.')
+    await state.clear()
+    await message.answer('⚙️ <b>Admin Control Panel</b>\nManage quizzes, papers, notes & broadcasts:', reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(F.data == 'adm:stats')
+async def adm_stats(call: CallbackQuery):
+    if call.from_user.id not in ADMINS: return
+    counts = [query(f'SELECT COUNT(*) AS n FROM {t}')[0]['n'] for t in ('students', 'papers', 'notes', 'questions')]
+    await call.message.answer(
+        f'📊 <b>Bot Database Stats</b>\n\n'
+        f'👨‍🎓 Registered Students: <b>{counts[0]}</b>\n'
+        f'📄 Past Papers: <b>{counts[1]}</b>\n'
+        f'📖 Short Notes: <b>{counts[2]}</b>\n'
+        f'❓ Quiz Questions: <b>{counts[3]}</b>',
+        reply_markup=admin_menu_keyboard()
+    )
+    await call.answer()
+
+
+# 1. Manual Question Addition Flow (Step-by-Step with buttons)
+@router.callback_query(F.data == 'adm:add_q_stream')
+async def adm_q_stream(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMINS: return
+    await state.clear()
+    await call.message.answer(
+        '1️⃣ Stream එක තෝරන්න:',
+        reply_markup=keyboard([(v, k) for k, v in STREAMS.items()], 'adm_qs')
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('adm_qs:'))
+async def adm_q_subject(call: CallbackQuery, state: FSMContext):
+    stream = call.data.split(':', 1)[1]
+    await state.update_data(stream=stream)
+    await call.message.answer(
+        '2️⃣ විෂය (Subject) තෝරන්න:',
+        reply_markup=keyboard([(s, s) for s in SUBJECTS[stream]], 'adm_qsub')
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('adm_qsub:'))
+async def adm_q_enter_question(call: CallbackQuery, state: FSMContext):
+    subject = call.data.split(':', 1)[1]
+    await state.update_data(subject=subject)
+    await state.set_state(ManualQuestion.question)
+    await call.message.answer(f'3️⃣ <b>{subject}</b> සඳහා MCQ ප්‍රශ්නය (Question text) type කර එවන්න:\n(/cancel to stop)')
+    await call.answer()
+
+
+@router.message(ManualQuestion.question)
+async def mq_q(message: Message, state: FSMContext):
+    text = (message.text or '').strip()
+    if not text: return await message.answer('කරුණාකර ප්‍රශ්නය ඇතුළත් කරන්න.')
+    await state.update_data(question=text)
+    await state.set_state(ManualQuestion.opt_a)
+    await message.answer('4️⃣ <b>Option A</b> ඇතුළත් කරන්න:')
+
+
+@router.message(ManualQuestion.opt_a)
+async def mq_a(message: Message, state: FSMContext):
+    await state.update_data(a=message.text.strip())
+    await state.set_state(ManualQuestion.opt_b)
+    await message.answer('5️⃣ <b>Option B</b> ඇතුළත් කරන්න:')
+
+
+@router.message(ManualQuestion.opt_b)
+async def mq_b(message: Message, state: FSMContext):
+    await state.update_data(b=message.text.strip())
+    await state.set_state(ManualQuestion.opt_c)
+    await message.answer('6️⃣ <b>Option C</b> ඇතුළත් කරන්න:')
+
+
+@router.message(ManualQuestion.opt_c)
+async def mq_c(message: Message, state: FSMContext):
+    await state.update_data(c=message.text.strip())
+    await state.set_state(ManualQuestion.opt_d)
+    await message.answer('7️⃣ <b>Option D</b> ඇතුළත් කරන්න:')
+
+
+@router.message(ManualQuestion.opt_d)
+async def mq_d(message: Message, state: FSMContext):
+    await state.update_data(d=message.text.strip())
+    await state.set_state(ManualQuestion.answer)
+    await message.answer(
+        '8️⃣ නිවැරදි පිළිතුර (Correct Answer) තෝරන්න:',
+        reply_markup=keyboard([(x, x) for x in 'ABCD'], 'mq_ans')
+    )
+
+
+@router.callback_query(F.data.startswith('mq_ans:'), ManualQuestion.answer)
+async def mq_ans(call: CallbackQuery, state: FSMContext):
+    ans = call.data.split(':', 1)[1]
+    await state.update_data(answer=ans)
+    await state.set_state(ManualQuestion.explanation)
+    await call.message.answer('9️⃣ පිළිතුර සඳහා පැහැදිලි කිරීම (Explanation in Sinhala/English) ඇතුළත් කරන්න:')
+    await call.answer()
+
+
+@router.message(ManualQuestion.explanation)
+async def mq_exp(message: Message, state: FSMContext):
+    exp = (message.text or '').strip()
+    data = await state.get_data()
+    execute(
+        'INSERT INTO questions(stream, subject, question, a, b, c, d, answer, explanation) '
+        'VALUES(?,?,?,?,?,?,?,?,?)',
+        (data['stream'], data['subject'], data['question'], data['a'], data['b'], data['c'], data['d'], data['answer'], exp)
+    )
+    await state.clear()
+    await message.answer(
+        f'✅ <b>ප්‍රශ්නය සාර්ථකව Database එකට Add විය!</b>\n\n'
+        f'📚 {data["subject"]}\n'
+        f'❓ {data["question"]}\n'
+        f'✔️ Answer: {data["answer"]}',
+        reply_markup=admin_menu_keyboard()
+    )
+
+
+# 2. AI Question Generator using Gemini API
+@router.callback_query(F.data == 'adm:ai_q_stream')
+async def adm_ai_stream(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMINS: return
+    if not GEMINI_API_KEY:
+        return await call.answer('GEMINI_API_KEY is not configured!', show_alert=True)
+    await state.clear()
+    await call.message.answer(
+        '✨ <b>Gemini AI Quiz Generator</b>\nStream එක තෝරන්න:',
+        reply_markup=keyboard([(v, k) for k, v in STREAMS.items()], 'ai_qs')
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('ai_qs:'))
+async def adm_ai_subj(call: CallbackQuery, state: FSMContext):
+    stream = call.data.split(':', 1)[1]
+    await state.update_data(stream=stream)
+    await call.message.answer(
+        'විෂය තෝරන්න:',
+        reply_markup=keyboard([(s, s) for s in SUBJECTS[stream]], 'ai_qsub')
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('ai_qsub:'))
+async def adm_ai_prompt(call: CallbackQuery, state: FSMContext):
+    subject = call.data.split(':', 1)[1]
+    await state.update_data(subject=subject)
+    await state.set_state(AIGenerateQuestions.prompt)
+    await call.message.answer(
+        f'🤖 <b>{subject}</b> සඳහා ප්‍රශ්න ජනනය කිරීමට මාතෘකාව (Topic or Lesson) එවන්න:\n'
+        '(උදා: "Newton\'s Laws", "Organic Chemistry Reactions", "Accounting Ratios")'
+    )
+    await call.answer()
+
+
+@router.message(AIGenerateQuestions.prompt)
+async def generate_ai_mcq(message: Message, state: FSMContext):
+    topic = message.text.strip()
+    data = await state.get_data()
+    stream = data['stream']
+    subject = data['subject']
+
+    await message.answer('⏳ Gemini AI මඟින් A/L standard MCQs 3ක් සාදමින් පවතී...')
+
+    prompt = (
+        f"Generate exactly 3 multiple choice questions for Sri Lankan GCE A/L {subject} on topic: '{topic}'.\n"
+        "Return ONLY a valid JSON array of objects with keys: "
+        "'question', 'a', 'b', 'c', 'd', 'answer' (one of A,B,C,D), 'explanation' (in Sinhala with clear theory).\n"
+        "Example format:\n"
+        '[{"question":"...","a":"...","b":"...","c":"...","d":"...","answer":"A","explanation":"..."}]'
+    )
+
+    try:
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_API_KEY}'
+        payload = {'contents': [{'parts': [{'text': prompt}]}]}
+        async with httpx.AsyncClient(timeout=45) as client:
+            res = await client.post(url, json=payload)
+            text = res.json()['candidates'][0]['content']['parts'][0]['text']
+
+        clean_json = text.strip().replace('```json', '').replace('```', '').strip()
+        items = json.loads(clean_json)
+
+        count = 0
+        for item in items:
+            execute(
+                'INSERT INTO questions(stream, subject, question, a, b, c, d, answer, explanation) '
+                'VALUES(?,?,?,?,?,?,?,?,?)',
+                (stream, subject, item['question'], item['a'], item['b'], item['c'], item['d'], item['answer'].upper(), item['explanation'])
+            )
+            count += 1
+
+        await state.clear()
+        await message.answer(
+            f'🎉 <b>Gemini AI මඟින් සාදන ලද ප්‍රශ්න {count}ක් සාර්ථකව Save විය!</b>\n'
+            f'සිසුන්ට දැන් {subject} Quiz හෝ Practice වලදී මේවා භාවිතා කළ හැක.',
+            reply_markup=admin_menu_keyboard()
+        )
+    except Exception as e:
+        logging.error('AI Generator Error: %s', e)
+        await message.answer(f'❌ ප්‍රශ්න සැකසීමේදී දෝෂයක් ඇති විය: {e}\nකරුණාකර නැවත උත්සාහ කරන්න.')
+
+
+# 3. Add Past Paper Flow
+@router.callback_query(F.data == 'adm:add_paper_stream')
+async def adm_paper_stream(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMINS: return
+    await state.clear()
+    await call.message.answer('Stream එක තෝරන්න:', reply_markup=keyboard([(v, k) for k, v in STREAMS.items()], 'adm_pps'))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('adm_pps:'))
+async def adm_paper_subj(call: CallbackQuery, state: FSMContext):
+    stream = call.data.split(':', 1)[1]
+    await state.update_data(stream=stream)
+    await call.message.answer('විෂය තෝරන්න:', reply_markup=keyboard([(s, s) for s in SUBJECTS[stream]], 'adm_ppsub'))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('adm_ppsub:'))
+async def adm_paper_year(call: CallbackQuery, state: FSMContext):
+    subject = call.data.split(':', 1)[1]
+    await state.update_data(subject=subject)
+    await state.set_state(AddPaper.year)
+    await call.message.answer(f'<b>{subject}</b> past paper එකට අදාළ වර්ෂය (Year, e.g. 2024) type කරන්න:')
+    await call.answer()
+
+
+@router.message(AddPaper.year)
+async def adm_paper_year_in(message: Message, state: FSMContext):
+    val = (message.text or '').strip()
+    if not val.isdigit() or not 2000 <= int(val) <= 2100:
+        return await message.answer('Enter valid year (2000–2100).')
+    await state.update_data(year=int(val))
+    await state.set_state(AddPaper.document)
+    await message.answer('📎 Past Paper PDF ගොනුව (Document ලෙස) Telegram වෙත send කරන්න:')
+
+
+@router.message(AddPaper.document, F.document)
+async def adm_paper_doc(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMINS: return
+    doc = message.document
+    if doc.mime_type != 'application/pdf':
+        return await message.answer('කරුණාකර PDF ගොනුවක් පමණක් එවන්න.')
+    data = await state.get_data()
+    execute(
+        'INSERT INTO papers(stream, subject, year, file_id) VALUES(?,?,?,?)',
+        (data['stream'], data['subject'], data['year'], doc.file_id)
+    )
+    await state.clear()
+    await message.answer(f'✅ Past Paper Saved: <b>{data["subject"]} - {data["year"]}</b>', reply_markup=admin_menu_keyboard())
+
+
+# 4. Add Short Note Flow
+@router.callback_query(F.data == 'adm:add_note_stream')
+async def adm_note_stream(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMINS: return
+    await state.clear()
+    await call.message.answer('Short Note එක සඳහා Stream එක තෝරන්න:', reply_markup=keyboard([(v, k) for k, v in STREAMS.items()], 'adm_nts'))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('adm_nts:'))
+async def adm_note_subj(call: CallbackQuery, state: FSMContext):
+    stream = call.data.split(':', 1)[1]
+    await state.update_data(stream=stream)
+    await call.message.answer('විෂය තෝරන්න:', reply_markup=keyboard([(s, s) for s in SUBJECTS[stream]], 'adm_ntsub'))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith('adm_ntsub:'))
+async def adm_note_title(call: CallbackQuery, state: FSMContext):
+    subject = call.data.split(':', 1)[1]
+    await state.update_data(subject=subject)
+    await state.set_state(AddNote.title)
+    await call.message.answer(f'<b>{subject}</b> Short Note එකේ මාතෘකාව (Title, e.g. "Kinematics Formula Summary") type කරන්න:')
+    await call.answer()
+
+
+@router.message(AddNote.title)
+async def adm_note_title_in(message: Message, state: FSMContext):
+    title = message.text.strip()
+    await state.update_data(title=title)
+    await state.set_state(AddNote.document)
+    await message.answer('📎 Short Note PDF ගොනුව send කරන්න:')
+
+
+@router.message(AddNote.document, F.document)
+async def adm_note_doc(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMINS: return
+    doc = message.document
+    if doc.mime_type != 'application/pdf':
+        return await message.answer('කරුණාකර PDF ගොනුවක් පමණක් එවන්න.')
+    data = await state.get_data()
+    execute(
+        'INSERT INTO notes(stream, subject, title, file_id) VALUES(?,?,?,?)',
+        (data['stream'], data['subject'], data['title'], doc.file_id)
+    )
+    await state.clear()
+    await message.answer(f'✅ Short Note Saved: <b>{data["subject"]} - {data["title"]}</b>', reply_markup=admin_menu_keyboard())
+
+
+# 5. Broadcast Announcement to All Students
+@router.callback_query(F.data == 'adm:broadcast')
+async def adm_broadcast(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMINS: return
+    await state.set_state(BroadcastMessage.message)
+    await call.message.answer('📢 සියලුම සිසුන් වෙත යැවිය යුතු පණිවිඩය (Text/Announcement) type කරන්න:\n(/cancel to stop)')
+    await call.answer()
+
+
+@router.message(BroadcastMessage.message)
+async def adm_broadcast_send(message: Message, state: FSMContext, bot: Bot):
+    text = message.text
+    students = query('SELECT user_id FROM students')
+    sent = 0
+    await message.answer(f'⏳ Students {len(students)} දෙනෙකු වෙත පණිවිඩය යවමින් පවතී...')
+    for s in students:
+        try:
+            await bot.send_message(s['user_id'], f'📢 <b>StudyLK Announcement:</b>\n\n{text}')
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    await state.clear()
+    await message.answer(f'✅ සිසුන් {sent}/{len(students)} දෙනෙකුට පණිවිඩය සාර්ථකව ලැබිණි.', reply_markup=admin_menu_keyboard())
+
+
+# ── Common /cancel & Fallback ────────────────────────────────────────────────
 
 @router.message(Command('cancel'))
 async def cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer('❌ Cancelled.', reply_markup=menu())
-
-
-# ── Admin helpers ─────────────────────────────────────────────────────────────
-
-def is_admin(message: Message):
-    return message.from_user.id in ADMINS
+    await message.answer('❌ Action cancelled.', reply_markup=menu(is_adm=(message.from_user.id in ADMINS)))
 
 
 @router.message(Command('myid'))
 async def myid(message: Message):
     await message.answer(f'Your Telegram ID: <code>{message.from_user.id}</code>')
 
-
-@router.message(Command('stats'))
-async def stats(message: Message):
-    if not is_admin(message): return await message.answer('Admin only.')
-    counts = [query(f'SELECT COUNT(*) AS n FROM {t}')[0]['n'] for t in ('students', 'papers', 'questions')]
-    top    = query(
-        'SELECT s.name, sc.points, sc.answered FROM scores sc '
-        'JOIN students s ON s.user_id=sc.user_id '
-        'ORDER BY sc.points DESC LIMIT 3'
-    )
-    top_text = '\n'.join(
-        f'{MEDALS[i] if i<3 else i+1}. {r["name"]} — {r["points"]} pts'
-        for i, r in enumerate(top)
-    ) or 'No quiz data.'
-    await message.answer(
-        f'📊 <b>Bot Stats</b>\n\n'
-        f'👨‍🎓 Students: {counts[0]}\n'
-        f'📄 Papers:   {counts[1]}\n'
-        f'❓ Questions:{counts[2]}\n\n'
-        f'🏆 <b>Top Players:</b>\n{top_text}'
-    )
-
-
-# ── Admin: Add Paper ──────────────────────────────────────────────────────────
-
-@router.message(Command('addpaper'))
-async def addpaper(message: Message, state: FSMContext):
-    if not is_admin(message): return await message.answer('Admin only.')
-    await state.clear()
-    await state.set_state(AddPaper.stream)
-    await message.answer('Stream key:\n<code>science / bio / commerce / arts / tech</code>')
-
-
-@router.message(AddPaper.stream)
-async def paper_stream(message: Message, state: FSMContext):
-    key = (message.text or '').strip().lower()
-    if key not in STREAMS: return await message.answer('Invalid stream. Try again.')
-    await state.update_data(stream=key)
-    await state.set_state(AddPaper.subject)
-    await message.answer('Subject name:\n' + '\n'.join(f'• {s}' for s in SUBJECTS[key]))
-
-
-@router.message(AddPaper.subject)
-async def paper_subject(message: Message, state: FSMContext):
-    data    = await state.get_data()
-    subject = (message.text or '').strip()
-    if subject not in SUBJECTS[data['stream']]: return await message.answer('Use exact subject name.')
-    await state.update_data(subject=subject)
-    await state.set_state(AddPaper.year)
-    await message.answer('Paper year (e.g. <code>2024</code>):')
-
-
-@router.message(AddPaper.year)
-async def paper_year(message: Message, state: FSMContext):
-    val = (message.text or '').strip()
-    if not val.isdigit() or not 2000 <= int(val) <= 2100:
-        return await message.answer('Enter valid year (2000–2100).')
-    await state.update_data(year=int(val))
-    await state.set_state(AddPaper.document)
-    await message.answer('📎 Send the PDF as a Telegram document.')
-
-
-@router.message(AddPaper.document, F.document)
-async def paper_document(message: Message, state: FSMContext):
-    if not is_admin(message): return
-    doc = message.document
-    if doc.mime_type != 'application/pdf' or doc.file_size > 20 * 1024 * 1024:
-        return await message.answer('Send a PDF up to 20 MB.')
-    data = await state.get_data()
-    execute(
-        'INSERT INTO papers(stream,subject,year,file_id) VALUES(?,?,?,?)',
-        (data['stream'], data['subject'], data['year'], doc.file_id),
-    )
-    await state.clear()
-    await message.answer(
-        f'✅ Paper saved!\n'
-        f'📚 {data["subject"]} — {data["year"]}',
-        reply_markup=menu(),
-    )
-
-
-# ── Admin: Add Question ───────────────────────────────────────────────────────
-
-@router.message(Command('addquestion'))
-async def addquestion(message: Message, state: FSMContext):
-    if not is_admin(message): return await message.answer('Admin only.')
-    await state.clear()
-    await state.set_state(AddQuestion.stream)
-    await message.answer('Stream key:\n<code>science / bio / commerce / arts / tech</code>')
-
-
-@router.message(AddQuestion.stream)
-async def question_stream(message: Message, state: FSMContext):
-    key = (message.text or '').strip().lower()
-    if key not in STREAMS: return await message.answer('Invalid stream.')
-    await state.update_data(stream=key)
-    await state.set_state(AddQuestion.subject)
-    await message.answer('Subject:\n' + '\n'.join(f'• {s}' for s in SUBJECTS[key]))
-
-
-@router.message(AddQuestion.subject)
-async def question_subject(message: Message, state: FSMContext):
-    data    = await state.get_data()
-    subject = (message.text or '').strip()
-    if subject not in SUBJECTS[data['stream']]: return await message.answer('Invalid subject.')
-    await state.update_data(subject=subject)
-    await state.set_state(AddQuestion.content)
-    await message.answer(
-        '📝 Send exactly <b>7 lines</b>:\n\n'
-        '<code>Question text\n'
-        'Option A\n'
-        'Option B\n'
-        'Option C\n'
-        'Option D\n'
-        'Correct letter (A/B/C/D)\n'
-        'Explanation (Sinhala/English)</code>'
-    )
-
-
-@router.message(AddQuestion.content)
-async def question_content(message: Message, state: FSMContext):
-    if not is_admin(message): return
-    lines = [x.strip() for x in (message.text or '').splitlines()]
-    if len(lines) != 7 or not all(lines) or lines[5].upper() not in 'ABCD' or len(lines[5]) != 1:
-        return await message.answer('Invalid format. Send exactly 7 non-empty lines; line 6 = A/B/C/D.')
-    data = await state.get_data()
-    execute(
-        'INSERT INTO questions(stream,subject,question,a,b,c,d,answer,explanation) VALUES(?,?,?,?,?,?,?,?,?)',
-        (data['stream'], data['subject'], *lines[:5], lines[5].upper(), lines[6]),
-    )
-    await state.clear()
-    await message.answer('✅ Question saved!', reply_markup=menu())
-
-
-# ── AI Tutor ──────────────────────────────────────────────────────────────────
-
-@router.message(AIChat.question)
-async def ai_question(message: Message, state: FSMContext):
-    prompt = (message.text or '').strip()
-    if not prompt or len(prompt) > 1200:
-        return await message.answer('Send a text question up to 1200 characters.')
-    await message.answer('🤖 Generating explanation...')
-    system = (
-        'You are a helpful Sri Lankan GCE A/L study tutor. '
-        'Explain clearly in simple Sinhala mixed with English technical terms where appropriate. '
-        'Show detailed step-by-step methods for calculations or derivations. '
-        'Be accurate according to Sri Lankan A/L syllabus.'
-    )
-
-    result = None
-
-    # 1. Try Gemini API if key is configured
-    if GEMINI_API_KEY:
-        try:
-            url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_API_KEY}'
-            payload = {
-                'system_instruction': {'parts': [{'text': system}]},
-                'contents': [{'parts': [{'text': prompt}]}]
-            }
-            async with httpx.AsyncClient(timeout=40) as client:
-                res = await client.post(url, json=payload)
-                if res.status_code == 200:
-                    data = res.json()
-                    candidates = data.get('candidates', [])
-                    if candidates and 'content' in candidates[0]:
-                        parts = candidates[0]['content'].get('parts', [])
-                        if parts:
-                            result = parts[0].get('text', '')
-        except Exception as e:
-            logging.error('Gemini error: %s', e)
-
-    # 2. Fallback to local Ollama if Gemini failed or key not set
-    if not result:
-        try:
-            async with httpx.AsyncClient(timeout=90) as client:
-                response = await client.post(
-                    f'{OLLAMA_URL}/api/chat',
-                    json={'model': OLLAMA_MODEL, 'stream': False,
-                          'messages': [{'role': 'system', 'content': system},
-                                       {'role': 'user',   'content': prompt}]},
-                )
-                if response.status_code == 200:
-                    result = response.json()['message']['content']
-        except Exception:
-            pass
-
-    if result:
-        for i in range(0, len(result), 3500):
-            await message.answer(result[i:i + 3500])
-    else:
-        await message.answer('⚠️ AI service temporarily unavailable. Use /cancel to go back.')
-
-
-# ── Fallback ──────────────────────────────────────────────────────────────────
 
 @router.message()
 async def fallback(message: Message):
@@ -752,7 +941,7 @@ async def fallback(message: Message):
     )
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+# ── Startup & Engine ──────────────────────────────────────────────────────────
 
 async def main():
     if not TOKEN or TOKEN == 'PASTE_BOTFATHER_TOKEN_HERE':
@@ -768,7 +957,6 @@ async def main():
     webhook_url = os.getenv('WEBHOOK_URL', '').rstrip('/')
 
     if webhook_url:
-        # ── WEBHOOK MODE (Render / any platform with public HTTPS URL) ────────
         from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
         from aiohttp import web
 
@@ -802,7 +990,6 @@ async def main():
         web.run_app(app, host='0.0.0.0', port=port)
 
     else:
-        # ── POLLING MODE (Railway / local PC) ─────────────────────────────────
         logging.info('WEBHOOK_URL not set → polling mode.')
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
