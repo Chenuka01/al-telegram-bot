@@ -1,6 +1,4 @@
 import asyncio
-import hashlib
-import hmac
 import logging
 import os
 import sqlite3
@@ -15,9 +13,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,17 +21,6 @@ TOKEN = os.getenv('BOT_TOKEN', '')
 ADMINS = {int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434').rstrip('/')
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3.2:3b')
-
-# Webhook settings (set these on Render as environment variables)
-# WEBHOOK_URL  = https://<your-app>.onrender.com
-# WEBHOOK_PATH = /webhook  (default)
-# WEBHOOK_SECRET = any random string for security
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', '').rstrip('/')
-WEBHOOK_PATH = os.getenv('WEBHOOK_PATH', '/webhook')
-WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
-
-# Render assigns a PORT env var; default 8080 for local testing
-PORT = int(os.getenv('PORT', '8080'))
 
 DB = Path(__file__).with_name('education.db')
 router = Router()
@@ -368,28 +353,7 @@ async def ai_question(message: Message, state: FSMContext):
 async def fallback(message: Message):
     await message.answer('Use /start for the menu, /myid for your ID, /cancel to exit.')
 
-
-async def on_startup(bot: Bot) -> None:
-    """Register the webhook with Telegram on server startup."""
-    if not WEBHOOK_URL:
-        logging.warning('WEBHOOK_URL not set – bot will not receive updates on this deployment.')
-        return
-    full_url = f'{WEBHOOK_URL}{WEBHOOK_PATH}'
-    await bot.set_webhook(
-        url=full_url,
-        secret_token=WEBHOOK_SECRET or None,
-        drop_pending_updates=True,
-    )
-    logging.info('Webhook set to %s', full_url)
-
-
-async def on_shutdown(bot: Bot) -> None:
-    """Remove the webhook cleanly when the server shuts down."""
-    await bot.delete_webhook()
-    logging.info('Webhook deleted.')
-
-
-def main():
+async def main():
     if not TOKEN or TOKEN == 'PASTE_BOTFATHER_TOKEN_HERE':
         raise RuntimeError('Set BOT_TOKEN in environment / .env')
 
@@ -403,28 +367,48 @@ def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Register startup / shutdown hooks on the dispatcher
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
+    webhook_url = os.getenv('WEBHOOK_URL', '').rstrip('/')
 
-    # Build the aiohttp web application
-    app = web.Application()
-    SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-        secret_token=WEBHOOK_SECRET or None,
-    ).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
+    if webhook_url:
+        # ── WEBHOOK MODE (Render / any platform with public HTTPS URL) ──────
+        from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+        from aiohttp import web
 
-    # Health-check endpoint so Render marks the service as healthy
-    async def health(request):
-        return web.Response(text='OK')
+        webhook_path   = os.getenv('WEBHOOK_PATH', '/webhook')
+        webhook_secret = os.getenv('WEBHOOK_SECRET', '') or None
+        port           = int(os.getenv('PORT', '8080'))
 
-    app.router.add_get('/', health)
+        async def on_startup(bot: Bot):
+            await bot.set_webhook(
+                url=f'{webhook_url}{webhook_path}',
+                secret_token=webhook_secret,
+                drop_pending_updates=True,
+            )
+            logging.info('Webhook set → %s%s', webhook_url, webhook_path)
 
-    # Start the aiohttp server – Render injects $PORT automatically
-    web.run_app(app, host='0.0.0.0', port=PORT)
+        async def on_shutdown(bot: Bot):
+            await bot.delete_webhook()
+            logging.info('Webhook removed.')
+
+        dp.startup.register(on_startup)
+        dp.shutdown.register(on_shutdown)
+
+        app = web.Application()
+        SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=webhook_secret).register(app, path=webhook_path)
+        setup_application(app, dp, bot=bot)
+
+        async def health(request):
+            return web.Response(text='OK')
+        app.router.add_get('/', health)
+
+        web.run_app(app, host='0.0.0.0', port=port)
+
+    else:
+        # ── POLLING MODE (Railway / local PC) ────────────────────────────────
+        logging.info('WEBHOOK_URL not set → starting in polling mode.')
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
