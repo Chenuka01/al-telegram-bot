@@ -222,6 +222,10 @@ class BroadcastMessage(StatesGroup):
     message = State()
 
 
+class AIChat(StatesGroup):
+    question = State()
+
+
 # ── /start & Main Menu ──────────────────────────────────────────────────────
 
 @router.message(CommandStart())
@@ -898,6 +902,49 @@ async def cancel(message: Message, state: FSMContext):
 @router.message(Command('myid'))
 async def myid(message: Message):
     await message.answer(f'Your Telegram ID: <code>{message.from_user.id}</code>')
+
+
+# ── AI Tutor (Gemini AI) ──────────────────────────────────────────────────────
+
+@router.message(AIChat.question)
+async def ai_question(message: Message, state: FSMContext):
+    prompt = (message.text or '').strip()
+    if not prompt or len(prompt) > 1200:
+        return await message.answer('Send a text question up to 1200 characters.')
+    await message.answer('🤖 Generating explanation...')
+    system = (
+        'You are a helpful Sri Lankan GCE A/L study tutor specializing in ICT and Accounting. '
+        'Explain clearly in simple Sinhala mixed with English technical terms where appropriate. '
+        'Show detailed step-by-step methods for calculations or code. '
+        'Be accurate according to Sri Lankan A/L syllabus.'
+    )
+
+    result = None
+
+    if GEMINI_API_KEY:
+        try:
+            url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={GEMINI_API_KEY}'
+            payload = {
+                'system_instruction': {'parts': [{'text': system}]},
+                'contents': [{'parts': [{'text': prompt}]}]
+            }
+            async with httpx.AsyncClient(timeout=40) as client:
+                res = await client.post(url, json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    candidates = data.get('candidates', [])
+                    if candidates and 'content' in candidates[0]:
+                        parts = candidates[0]['content'].get('parts', [])
+                        if parts:
+                            result = parts[0].get('text', '')
+        except Exception as e:
+            logging.error('Gemini error: %s', e)
+
+    if result:
+        for i in range(0, len(result), 3500):
+            await message.answer(result[i:i + 3500])
+    else:
+        await message.answer('⚠️ AI service temporarily unavailable. Use /cancel to go back.')
 
 
 @router.message()
