@@ -962,8 +962,13 @@ async def main():
     if not TOKEN or TOKEN == 'PASTE_BOTFATHER_TOKEN_HERE':
         raise RuntimeError('Set BOT_TOKEN in environment / .env')
 
-    init_db()
     logging.basicConfig(level=logging.INFO)
+    logging.info('==========================================')
+    logging.info('StudyLKBot v2.5 (ICT & Accounting Specialized) STARTING')
+    logging.info('Configured Admins: %s', ADMINS)
+    logging.info('==========================================')
+
+    init_db()
 
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp  = Dispatcher(storage=MemoryStorage())
